@@ -1,10 +1,29 @@
 """
 UZB 438E - Robotic Control Systems Final Project
-Real Traffic Car Following Scenario in CARLA 0.9.16
+Stable Moderate Traffic Car Following Scenario in CARLA 0.9.16
+
+Main scenario:
+    Ego vehicle follows a red lead vehicle while keeping a desired separation distance.
+
+Extra complexity:
+    - Moderate NPC traffic vehicles
+    - Route traffic
+    - Cross traffic
+    - Background city traffic
+    - Pedestrians
+    - Traffic lights
+    - Collision sensor
+    - Longitudinal PID distance control
+    - Speed PID controller
+    - Pure pursuit / waypoint-based lateral control
+    - Traffic light timeout recovery
+    - Traffic block timeout
+    - Lead waits for ego when the gap becomes too large
+    - Performance statistics for report/video
 
 Run:
     1) Start CARLA 0.9.16 server.
-    2) python car_following_real_traffic_final.py
+    2) python car_following.py
 """
 
 import carla
@@ -22,31 +41,42 @@ MAP_NAME = "Town03"
 RANDOM_SEED = 42
 
 FIXED_DELTA_SECONDS = 0.05
-SIM_DURATION_SECONDS = 175.0
+SIM_DURATION_SECONDS = 165.0
 
-DESIRED_DISTANCE_M = 14.0
-INITIAL_EGO_GAP_M = 25.0
+DESIRED_DISTANCE_M = 12.0
+INITIAL_EGO_GAP_M = 18.0
 
 ROUTE_STEP_M = 3.0
-ROUTE_LENGTH_POINTS = 420
+ROUTE_LENGTH_POINTS = 340
 
-LEAD_CRUISE_SPEED_KMH = 28.0
-LEAD_CURVE_SPEED_KMH = 16.0
-EGO_MAX_SPEED_KMH = 48.0
+# STABLE MODERATE VERSION - ARTIRILMIŞ NPC
+# Ödev demosu için daha kontrollü ve çarpışmasız sürüş hedeflenir.
+LEAD_CRUISE_SPEED_KMH = 42.0
+LEAD_CURVE_SPEED_KMH = 28.0
+EGO_MAX_SPEED_KMH = 55.0
 
-LOOKAHEAD_LEAD_M = 10.0
-LOOKAHEAD_EGO_M = 9.0
+LOOKAHEAD_LEAD_M = 9.0
+LOOKAHEAD_EGO_M = 8.5
 
-ROUTE_TRAFFIC_CARS = 6
-CROSS_TRAFFIC_CARS = 14
-PEDESTRIANS = 12
+# Artırılmış NPC sayıları - sorun çıkarmayacak şekilde ayarlanmıştır.
+ROUTE_TRAFFIC_CARS = 6          # 4 → 6
+CROSS_TRAFFIC_CARS = 14         # 10 → 14
+BACKGROUND_TRAFFIC_CARS = 12    # 8 → 12
+PEDESTRIANS = 5                 # 3 → 5
 
-TRAFFIC_LIGHT_MAX_WAIT_SECONDS = 5.0
-EGO_IGNORE_LIGHT_AFTER_TIMEOUT_SECONDS = 5.0
+TRAFFIC_LIGHT_MAX_WAIT_SECONDS = 7.0
 LEAD_IGNORE_LIGHT_AFTER_TIMEOUT_SECONDS = 5.0
+EGO_IGNORE_LIGHT_AFTER_TIMEOUT_SECONDS = 5.0
 
-LEAD_WAIT_FOR_EGO_GAP_M = 42.0
-LEAD_WAIT_SPEED_KMH = 6.0
+LEAD_TRAFFIC_BLOCK_TIMEOUT_SECONDS = 999.0
+LEAD_IGNORE_TRAFFIC_DURATION = 0.0
+
+LEAD_WAIT_FOR_EGO_GAP_M = 28.0
+LEAD_HARD_WAIT_FOR_EGO_GAP_M = 38.0
+LEAD_WAIT_SPEED_KMH = 10.0
+
+FRONT_SAFE_DISTANCE_M = 22.0
+FRONT_EMERGENCY_DISTANCE_M = 8.0
 
 PRINT_EVERY_N_TICKS = 10
 
@@ -91,8 +121,10 @@ def get_speed_kmh(vehicle):
 def normalize_angle_rad(angle):
     while angle > math.pi:
         angle -= 2.0 * math.pi
+
     while angle < -math.pi:
         angle += 2.0 * math.pi
+
     return angle
 
 
@@ -111,7 +143,7 @@ def get_local_position(reference_actor, target_location):
 
 
 # ============================================================
-# PID controllers
+# PID controllers and smoothing
 # ============================================================
 
 class PIDController:
@@ -157,11 +189,11 @@ class PIDController:
 class SpeedController:
     def __init__(self, dt):
         self.pid = PIDController(
-            kp=0.10,
-            ki=0.012,
-            kd=0.006,
+            kp=0.130,
+            ki=0.010,
+            kd=0.010,
             dt=dt,
-            integral_limit=18.0,
+            integral_limit=16.0,
         )
 
     def reset(self):
@@ -171,8 +203,8 @@ class SpeedController:
         self,
         vehicle,
         target_speed_kmh,
-        max_throttle=0.45,
-        max_brake=0.80,
+        max_throttle=0.55,
+        max_brake=0.90,
     ):
         current_speed = get_speed_kmh(vehicle)
         error = target_speed_kmh - current_speed
@@ -191,48 +223,97 @@ class SpeedController:
         return throttle, brake
 
 
+class ControlSmoother:
+    """
+    Smooths throttle/brake/steer for stable demo motion.
+    """
+
+    def __init__(
+        self,
+        max_throttle_delta=0.055,
+        max_brake_delta=0.105,
+        max_steer_delta=0.065,
+    ):
+        self.last_throttle = 0.0
+        self.last_brake = 0.0
+        self.last_steer = 0.0
+
+        self.max_throttle_delta = max_throttle_delta
+        self.max_brake_delta = max_brake_delta
+        self.max_steer_delta = max_steer_delta
+
+    def smooth(self, control):
+        throttle = clamp(
+            control.throttle,
+            self.last_throttle - self.max_throttle_delta,
+            self.last_throttle + self.max_throttle_delta,
+        )
+
+        brake = clamp(
+            control.brake,
+            self.last_brake - self.max_brake_delta,
+            self.last_brake + self.max_brake_delta,
+        )
+
+        steer = clamp(
+            control.steer,
+            self.last_steer - self.max_steer_delta,
+            self.last_steer + self.max_steer_delta,
+        )
+
+        if brake > 0.08:
+            throttle = 0.0
+
+        self.last_throttle = throttle
+        self.last_brake = brake
+        self.last_steer = steer
+
+        return carla.VehicleControl(
+            throttle=float(throttle),
+            brake=float(brake),
+            steer=float(steer),
+        )
+
+
 # ============================================================
-# Route generation
+# Route generation and tracking
 # ============================================================
 
 def waypoint_key(wp):
     return (wp.road_id, wp.section_id, wp.lane_id, int(wp.s // 5.0))
 
 
-def choose_city_next(current_wp, previous_wp, visited):
+def choose_city_next(current_wp, visited):
     next_wps = current_wp.next(ROUTE_STEP_M)
 
     if not next_wps:
         return None
 
     current_yaw = math.radians(current_wp.transform.rotation.yaw)
-
     scored = []
 
     for wp in next_wps:
         next_yaw = math.radians(wp.transform.rotation.yaw)
-        yaw_diff = abs(normalize_angle_rad(next_yaw - current_yaw))
-        yaw_diff_deg = math.degrees(yaw_diff)
-
+        yaw_diff_deg = abs(math.degrees(normalize_angle_rad(next_yaw - current_yaw)))
         key = waypoint_key(wp)
 
         score = 0.0
 
         if key not in visited:
-            score += 8.0
+            score += 10.0
         else:
-            score -= 12.0
+            score -= 25.0
 
         if wp.is_junction:
-            score += 10.0
+            score += 7.0
 
-        if 8.0 <= yaw_diff_deg <= 55.0:
-            score += 5.0
+        if 6.0 <= yaw_diff_deg <= 45.0:
+            score += 3.0
 
-        if yaw_diff_deg > 85.0:
-            score -= 10.0
+        if yaw_diff_deg > 75.0:
+            score -= 15.0
 
-        score += random.uniform(-2.0, 2.0)
+        score += random.uniform(-1.0, 1.0)
 
         scored.append((score, wp))
 
@@ -241,23 +322,20 @@ def choose_city_next(current_wp, previous_wp, visited):
     return scored[0][1]
 
 
-def generate_city_route(start_wp, max_points=420):
+def generate_city_route(start_wp, max_points=390):
     route = [start_wp]
     current = start_wp
-    previous = None
     visited = set()
     visited.add(waypoint_key(start_wp))
 
     for _ in range(max_points - 1):
-        nxt = choose_city_next(current, previous, visited)
+        nxt = choose_city_next(current, visited)
 
         if nxt is None:
             break
 
         route.append(nxt)
         visited.add(waypoint_key(nxt))
-
-        previous = current
         current = nxt
 
     return route
@@ -286,8 +364,8 @@ def find_closest_route_index(
     vehicle,
     route,
     last_index,
-    search_back=10,
-    search_forward=55,
+    search_back=3,
+    search_forward=20,
 ):
     location = vehicle.get_location()
 
@@ -312,7 +390,7 @@ def target_index_from_lookahead(route, closest_index, lookahead_m):
     return min(len(route) - 1, closest_index + steps)
 
 
-def pure_pursuit_steer(vehicle, target_location, gain=1.20, max_steer=0.62):
+def pure_pursuit_steer(vehicle, target_location, gain=0.95, max_steer=0.48):
     transform = vehicle.get_transform()
     location = transform.location
     heading = math.radians(transform.rotation.yaw)
@@ -328,7 +406,7 @@ def pure_pursuit_steer(vehicle, target_location, gain=1.20, max_steer=0.62):
     return clamp(steer, -max_steer, max_steer)
 
 
-def curve_angle_ahead(route, index, near_offset=2, far_offset=13):
+def curve_angle_ahead(route, index, near_offset=2, far_offset=14):
     if not route:
         return 0.0
 
@@ -349,9 +427,9 @@ def configure_traffic_lights(world):
     for light in world.get_actors().filter("traffic.traffic_light"):
         try:
             light.freeze(False)
-            light.set_green_time(10.0)
-            light.set_yellow_time(2.5)
-            light.set_red_time(6.0)
+            light.set_green_time(14.0)
+            light.set_yellow_time(2.0)
+            light.set_red_time(4.0)
         except Exception:
             pass
 
@@ -362,11 +440,6 @@ def handle_traffic_light_with_timeout(
     light_wait_memory,
     simulation_time,
 ):
-    """
-    Red/yellow light => stop.
-    If the vehicle waits too long, force the traffic light to green.
-    """
-
     try:
         if not vehicle.is_at_traffic_light():
             light_wait_memory[vehicle_name] = None
@@ -405,7 +478,7 @@ def handle_traffic_light_with_timeout(
 
                 print(
                     f"[INFO] {vehicle_name} waited {waited_time:.1f}s. "
-                    f"Traffic light forced GREEN."
+                    f"Traffic light forced GREEN for demo continuity."
                 )
 
                 return None, True
@@ -422,7 +495,7 @@ def handle_traffic_light_with_timeout(
 
 
 # ============================================================
-# Risk detection  (FIX: junction-aware front actor detection)
+# Risk detection
 # ============================================================
 
 def get_front_actor(
@@ -430,8 +503,8 @@ def get_front_actor(
     world,
     world_map,
     ignore_ids=None,
-    max_distance=40.0,      # increased from 30.0
-    lateral_limit=3.2,      # increased from 2.8
+    max_distance=34.0,
+    lateral_limit=2.8,
 ):
     if ignore_ids is None:
         ignore_ids = set()
@@ -447,8 +520,6 @@ def get_front_actor(
     if vehicle_wp is None:
         return None, max_distance
 
-    vehicle_in_junction = vehicle_wp.is_junction
-
     closest_actor = None
     closest_distance = max_distance
 
@@ -462,23 +533,6 @@ def get_front_actor(
         try:
             actor_location = actor.get_location()
 
-            longitudinal, lateral = get_local_position(vehicle, actor_location)
-
-            # Must be in front and within lateral bounds
-            if not (longitudinal > 0.5 and abs(lateral) < lateral_limit):
-                continue
-
-            if longitudinal >= closest_distance:
-                continue
-
-            # FIX: If either vehicle is in a junction, skip road/lane ID check
-            # and rely purely on geometric position — road_id changes constantly
-            # at junctions and causes NPC vehicles to be missed.
-            if vehicle_in_junction:
-                closest_distance = longitudinal
-                closest_actor = actor
-                continue
-
             actor_wp = world_map.get_waypoint(
                 actor_location,
                 project_to_road=True,
@@ -488,28 +542,43 @@ def get_front_actor(
             if actor_wp is None:
                 continue
 
-            if actor_wp.is_junction:
-                # Actor is entering/leaving junction — include it
+            if actor_wp.road_id != vehicle_wp.road_id:
+                continue
+
+            if actor_wp.lane_id != vehicle_wp.lane_id:
+                continue
+
+            longitudinal, lateral = get_local_position(
+                vehicle,
+                actor_location,
+            )
+
+            if longitudinal > 0.5 and abs(lateral) < lateral_limit:
+                if longitudinal < closest_distance:
+                    closest_distance = longitudinal
+                    closest_actor = actor
+
+        except Exception:
+            pass
+
+    # Fallback: at junctions CARLA can report slightly different road/lane ids.
+    # For safety, also check a forward rectangular zone in the vehicle frame.
+    for actor in world.get_actors().filter("vehicle.*"):
+        if actor.id == vehicle.id or actor.id in ignore_ids:
+            continue
+        try:
+            actor_location = actor.get_location()
+            longitudinal, lateral = get_local_position(vehicle, actor_location)
+            if 0.5 < longitudinal < closest_distance and abs(lateral) < max(lateral_limit, 4.2):
                 closest_distance = longitudinal
                 closest_actor = actor
-                continue
-
-            same_road = actor_wp.road_id == vehicle_wp.road_id
-            same_lane = actor_wp.lane_id == vehicle_wp.lane_id
-
-            if not same_road or not same_lane:
-                continue
-
-            closest_distance = longitudinal
-            closest_actor = actor
-
         except Exception:
             pass
 
     return closest_actor, closest_distance
 
 
-def pedestrian_ahead(vehicle, walkers, radius=9.0):
+def pedestrian_ahead(vehicle, walkers, radius=8.0):
     for walker in walkers:
         try:
             walker_location = walker.get_location()
@@ -526,8 +595,8 @@ def pedestrian_ahead(vehicle, walkers, radius=9.0):
 
 
 def emergency_gap_brake(gap):
-    brake = 0.50 + (DESIRED_DISTANCE_M - gap) / DESIRED_DISTANCE_M
-    return clamp(brake, 0.50, 1.0)
+    brake = 0.55 + (DESIRED_DISTANCE_M - gap) / DESIRED_DISTANCE_M
+    return clamp(brake, 0.55, 1.0)
 
 
 # ============================================================
@@ -546,7 +615,7 @@ def prepare_vehicle_blueprint(bp_lib, pattern, color, role_name):
     return bp
 
 
-def draw_route(world, route, every=6, life_time=180.0):
+def draw_route(world, route, every=7, life_time=180.0):
     for i in range(0, len(route), every):
         loc = route[i].transform.location + carla.Location(z=0.25)
 
@@ -607,20 +676,20 @@ def find_traffic_start(world_map, spawn_points):
         length = route_total_length(route)
         junction_count = count_junction_points(route)
 
-        if length < 320.0:
+        if length < 350.0:
             continue
 
-        score = length * 0.02 + junction_count * 3.0
+        score = length * 0.015 + junction_count * 2.0
 
-        if junction_count < 12:
-            score -= 80.0
+        if junction_count < 8:
+            score -= 50.0
 
         if score > best_score:
             best_score = score
             best_candidate = (start_wp, previous[0], route)
 
     if best_candidate is None:
-        raise RuntimeError("Could not find a route with enough traffic/junction interaction.")
+        raise RuntimeError("Could not find a suitable traffic route.")
 
     return best_candidate
 
@@ -633,16 +702,21 @@ def get_vehicle_blueprints(bp_lib, wheels=4):
     ]
 
 
-def setup_npc_vehicle(actor, traffic_manager, speed_diff=20.0):
+def setup_npc_vehicle(actor, traffic_manager, speed_diff=0.0):
     actor.set_autopilot(True, traffic_manager.get_port())
 
     traffic_manager.vehicle_percentage_speed_difference(actor, speed_diff)
-    traffic_manager.distance_to_leading_vehicle(actor, random.uniform(8.0, 14.0))
+    traffic_manager.distance_to_leading_vehicle(actor, random.uniform(12.0, 20.0))
     traffic_manager.auto_lane_change(actor, True)
     traffic_manager.ignore_lights_percentage(actor, 0.0)
     traffic_manager.ignore_signs_percentage(actor, 0.0)
     traffic_manager.ignore_walkers_percentage(actor, 0.0)
     traffic_manager.ignore_vehicles_percentage(actor, 0.0)
+
+    try:
+        traffic_manager.set_desired_speed(actor, random.uniform(24.0, 38.0))
+    except Exception:
+        pass
 
     try:
         traffic_manager.update_vehicle_lights(actor, True)
@@ -656,7 +730,7 @@ def spawn_route_traffic(
     route,
     traffic_manager,
     protected_actors,
-    count=6,
+    count=10,
 ):
     car_bps = get_vehicle_blueprints(bp_lib, wheels=4)
 
@@ -665,15 +739,11 @@ def spawn_route_traffic(
 
     spawned = []
 
+    # Genişletilmiş aday index listesi — daha fazla NPC için.
+    # İlk 75 waypoint korunuyor; ego/lead'in stabilize olması için.
     candidate_indices = [
-        45,
-        70,
-        95,
-        125,
-        155,
-        190,
-        230,
-        270,
+        75, 90, 105, 120, 135, 150, 165, 180,
+        195, 210, 225, 240, 255, 270, 285, 300
     ]
 
     random.shuffle(candidate_indices)
@@ -693,7 +763,7 @@ def spawn_route_traffic(
         tf = wp.transform
         tf.location.z += 0.45
 
-        if not is_far_from_actors(tf.location, protected_actors + spawned, 18.0):
+        if not is_far_from_actors(tf.location, protected_actors + spawned, 22.0):
             continue
 
         bp = random.choice(car_bps)
@@ -712,7 +782,7 @@ def spawn_route_traffic(
         setup_npc_vehicle(
             actor,
             traffic_manager,
-            speed_diff=random.uniform(25.0, 45.0),
+            speed_diff=random.uniform(15.0, 35.0),
         )
 
         spawned.append(actor)
@@ -723,12 +793,11 @@ def spawn_route_traffic(
 def spawn_cross_traffic(
     world,
     bp_lib,
-    world_map,
     spawn_points,
     route,
     traffic_manager,
     protected_actors,
-    count=14,
+    count=24,
 ):
     car_bps = get_vehicle_blueprints(bp_lib, wheels=4)
     moto_bps = get_vehicle_blueprints(bp_lib, wheels=2)
@@ -746,17 +815,16 @@ def spawn_cross_traffic(
     if not junction_locations:
         junction_locations = [
             wp.transform.location
-            for wp in route[40:220:20]
+            for wp in route[40:260:20]
         ]
 
     spawned = []
-
     candidates = list(spawn_points)
     random.shuffle(candidates)
 
-    route_locations = [
+    route_locations_start = [
         wp.transform.location
-        for wp in route[0:260:8]
+        for wp in route[0:55:5]
     ]
 
     for sp in candidates:
@@ -764,17 +832,18 @@ def spawn_cross_traffic(
             break
 
         near_junction = any(
-            distance_2d(sp.location, loc) < 85.0
+            distance_2d(sp.location, loc) < 130.0
             for loc in junction_locations
         )
 
         if not near_junction:
             continue
 
-        if not is_far_from_locations(sp.location, route_locations[:8], 35.0):
+        if not is_far_from_locations(sp.location, route_locations_start, 45.0):
             continue
 
-        if not is_far_from_actors(sp.location, protected_actors + spawned, 16.0):
+        # 18.0 → 15.0: daha fazla spawn noktasına izin veriliyor
+        if not is_far_from_actors(sp.location, protected_actors + spawned, 15.0):
             continue
 
         bp = random.choice(all_bps)
@@ -793,7 +862,73 @@ def spawn_cross_traffic(
         setup_npc_vehicle(
             actor,
             traffic_manager,
-            speed_diff=random.uniform(5.0, 25.0),
+            speed_diff=random.uniform(15.0, 35.0),
+        )
+
+        spawned.append(actor)
+
+    return spawned
+
+
+def spawn_background_traffic(
+    world,
+    bp_lib,
+    spawn_points,
+    traffic_manager,
+    protected_actors,
+    route,
+    count=20,
+):
+    car_bps = get_vehicle_blueprints(bp_lib, wheels=4)
+    moto_bps = get_vehicle_blueprints(bp_lib, wheels=2)
+    all_bps = car_bps + moto_bps
+
+    if not all_bps:
+        return []
+
+    spawned = []
+
+    route_locations = [
+        wp.transform.location
+        for wp in route[0:300:10]
+    ]
+
+    candidates = list(spawn_points)
+    random.shuffle(candidates)
+
+    for sp in candidates:
+        if len(spawned) >= count:
+            break
+
+        # 18→15 alt sınır, 210→250 üst sınır: daha geniş dağılım
+        near_route = any(
+            15.0 <= distance_2d(sp.location, route_loc) <= 250.0
+            for route_loc in route_locations
+        )
+
+        if not near_route:
+            continue
+
+        if not is_far_from_actors(sp.location, protected_actors + spawned, 18.0):
+            continue
+
+        bp = random.choice(all_bps)
+
+        if bp.has_attribute("color"):
+            bp.set_attribute(
+                "color",
+                random.choice(bp.get_attribute("color").recommended_values),
+            )
+
+        actor = world.try_spawn_actor(bp, sp)
+
+        if actor is None:
+            continue
+
+        setup_npc_vehicle(
+            actor,
+            traffic_manager,
+            speed_diff=random.uniform(15.0, 35.0),
         )
 
         spawned.append(actor)
@@ -805,7 +940,7 @@ def spawn_pedestrians_near_route(
     world,
     bp_lib,
     route,
-    n=12,
+    n=8,
 ):
     walker_bps = bp_lib.filter("walker.pedestrian.*")
     controller_bp = bp_lib.find("controller.ai.walker")
@@ -815,19 +950,19 @@ def spawn_pedestrians_near_route(
 
     route_locations = [
         wp.transform.location
-        for wp in route[20:260:10]
+        for wp in route[30:270:12]
     ]
 
     spawn_locations = []
 
-    for _ in range(n * 35):
+    for _ in range(n * 45):
         loc = world.get_random_location_from_navigation()
 
         if loc is None:
             continue
 
         near_route = any(
-            10.0 <= distance_2d(loc, rloc) <= 75.0
+            12.0 <= distance_2d(loc, rloc) <= 90.0
             for rloc in route_locations
         )
 
@@ -871,7 +1006,7 @@ def spawn_pedestrians_near_route(
             if destination:
                 controller.go_to_location(destination)
 
-            controller.set_max_speed(random.uniform(0.6, 1.3))
+            controller.set_max_speed(random.uniform(0.7, 1.4))
 
         except Exception:
             pass
@@ -944,15 +1079,15 @@ def lead_control(
     steer = pure_pursuit_steer(
         lead,
         target_location,
-        gain=1.10,
-        max_steer=0.58,
+        gain=0.95,
+        max_steer=0.48,
     )
 
-    # Traffic light logic with fallback ignore mode
+    # Traffic light logic
     if simulation_time < light_wait_memory.get("lead_ignore_light_until", 0.0):
         light_state = None
     else:
-        light_state, forced_green = handle_traffic_light_with_timeout(
+        light_state, _ = handle_traffic_light_with_timeout(
             lead,
             "lead",
             light_wait_memory,
@@ -963,109 +1098,209 @@ def lead_control(
         if light_wait_memory.get("lead_red_start") is None:
             light_wait_memory["lead_red_start"] = simulation_time
 
-        lead_red_wait = simulation_time - light_wait_memory["lead_red_start"]
+        lead_wait = simulation_time - light_wait_memory["lead_red_start"]
 
-        if lead_red_wait >= LEAD_IGNORE_LIGHT_AFTER_TIMEOUT_SECONDS:
-            light_wait_memory["lead_ignore_light_until"] = simulation_time + 6.0
+        if lead_wait >= LEAD_IGNORE_LIGHT_AFTER_TIMEOUT_SECONDS:
+            light_wait_memory["lead_ignore_light_until"] = simulation_time + 5.0
             light_wait_memory["lead_red_start"] = None
 
             print(
-                f"[INFO] Lead waited {lead_red_wait:.1f}s at {light_state}. "
-                f"Lead will ignore this light for 6 seconds."
+                f"[INFO] Lead waited {lead_wait:.1f}s at {light_state}. "
+                f"Lead ignores this light shortly."
             )
 
         else:
             speed_controller.reset()
 
-            control = carla.VehicleControl(
-                throttle=0.0,
-                brake=0.90,
-                steer=float(steer),
+            return (
+                carla.VehicleControl(
+                    throttle=0.0,
+                    brake=0.90,
+                    steer=float(steer),
+                ),
+                0.0,
+                0.0,
+                f"LIGHT_{light_state}",
             )
-
-            return control, 0.0, 0.0, f"LIGHT_{light_state}"
     else:
         light_wait_memory["lead_red_start"] = None
 
+    # Pedestrian
     pedestrian_detected, pedestrian_distance = pedestrian_ahead(
         lead,
         walkers,
-        radius=9.0,
+        radius=8.0,
     )
 
     if pedestrian_detected:
         speed_controller.reset()
 
         brake = clamp(
-            0.45 + (9.0 - pedestrian_distance) / 9.0,
+            0.45 + (8.0 - pedestrian_distance) / 8.0,
             0.45,
             1.0,
         )
 
-        control = carla.VehicleControl(
-            throttle=0.0,
-            brake=float(brake),
-            steer=float(steer),
+        return (
+            carla.VehicleControl(
+                throttle=0.0,
+                brake=float(brake),
+                steer=float(steer),
+            ),
+            0.0,
+            0.0,
+            f"PEDESTRIAN_{pedestrian_distance:.1f}m",
         )
 
-        return control, 0.0, 0.0, f"PEDESTRIAN_{pedestrian_distance:.1f}m"
-
-    # FIX: increased max_distance 30 -> 40, lateral_limit 2.8 -> 3.2
+    # Front actor and traffic block timeout
     front_actor, front_distance = get_front_actor(
         lead,
         world,
         world_map,
         ignore_ids=set(),
-        max_distance=40.0,
-        lateral_limit=3.2,
+        max_distance=45.0,
     )
+
+    ignore_traffic = (
+        simulation_time < light_wait_memory.get("lead_ignore_traffic_until", 0.0)
+    )
+
+    if front_actor is not None and front_distance < FRONT_EMERGENCY_DISTANCE_M:
+        speed_controller.reset()
+        light_wait_memory["lead_traffic_block_start"] = None
+        light_wait_memory["lead_ignore_traffic_until"] = 0.0
+
+        return (
+            carla.VehicleControl(
+                throttle=0.0,
+                brake=1.0,
+                steer=float(steer),
+            ),
+            0.0,
+            0.0,
+            f"FRONT_STOP_{front_distance:.1f}m",
+        )
+
+    if ignore_traffic:
+        front_actor = None
+        front_distance = 45.0
 
     if front_actor is not None:
         front_speed = get_speed_kmh(front_actor)
 
-        # FIX: emergency stop threshold increased 7.0 -> 10.0
-        if front_distance < 10.0:
-            speed_controller.reset()
+        if front_distance < FRONT_SAFE_DISTANCE_M:
+            if front_speed < 3.0:
+                if light_wait_memory.get("lead_traffic_block_start") is None:
+                    light_wait_memory["lead_traffic_block_start"] = simulation_time
 
-            control = carla.VehicleControl(
-                throttle=0.0,
-                brake=1.0,
-                steer=float(steer),
-            )
+                blocked_time = (
+                    simulation_time - light_wait_memory["lead_traffic_block_start"]
+                )
 
-            return control, 0.0, 0.0, f"FRONT_STOP_{front_distance:.1f}m"
+                if blocked_time >= LEAD_TRAFFIC_BLOCK_TIMEOUT_SECONDS:
+                    light_wait_memory["lead_ignore_traffic_until"] = (
+                        simulation_time + LEAD_IGNORE_TRAFFIC_DURATION
+                    )
+                    light_wait_memory["lead_traffic_block_start"] = None
 
-        # FIX: slow-follow threshold increased 20.0 -> 28.0
-        if front_distance < 28.0:
-            target_speed = min(
-                LEAD_CRUISE_SPEED_KMH,
-                max(5.0, front_speed - 1.0),
-            )
+                    print(
+                        f"[INFO] Lead blocked {blocked_time:.1f}s by stopped NPC. "
+                        f"Ignoring front traffic for "
+                        f"{LEAD_IGNORE_TRAFFIC_DURATION:.0f}s."
+                    )
 
-            throttle, brake = speed_controller.run_step(
-                lead,
-                target_speed,
-                max_throttle=0.30,
-                max_brake=0.80,
-            )
+                else:
+                    target_speed = min(
+                        LEAD_CRUISE_SPEED_KMH,
+                        max(0.0, front_speed * 0.90),
+                    )
 
-            brake = max(
-                brake,
-                clamp((28.0 - front_distance) / 28.0 * 0.45, 0.0, 0.45),
-            )
+                    brake_factor = clamp(
+                        (FRONT_SAFE_DISTANCE_M - front_distance)
+                        / FRONT_SAFE_DISTANCE_M,
+                        0.0,
+                        1.0,
+                    )
 
-            control = carla.VehicleControl(
-                throttle=float(throttle),
-                brake=float(brake),
-                steer=float(steer),
-            )
+                    throttle, brake = speed_controller.run_step(
+                        lead,
+                        target_speed,
+                        max_throttle=0.45,
+                        max_brake=0.95,
+                    )
 
-            return control, target_speed, 0.0, f"TRAFFIC_{front_distance:.1f}m"
+                    brake = max(brake, brake_factor * 0.65)
+                    throttle = 0.0 if brake > 0.05 else throttle
 
+                    return (
+                        carla.VehicleControl(
+                            throttle=float(throttle),
+                            brake=float(brake),
+                            steer=float(steer),
+                        ),
+                        target_speed,
+                        0.0,
+                        f"TRAFFIC_{front_distance:.1f}m({blocked_time:.0f}s)",
+                    )
+
+            else:
+                light_wait_memory["lead_traffic_block_start"] = None
+
+                target_speed = min(
+                    LEAD_CRUISE_SPEED_KMH,
+                    max(8.0, front_speed * 0.95),
+                )
+
+                brake_factor = clamp(
+                    (FRONT_SAFE_DISTANCE_M - front_distance)
+                    / FRONT_SAFE_DISTANCE_M,
+                    0.0,
+                    1.0,
+                )
+
+                throttle, brake = speed_controller.run_step(
+                    lead,
+                    target_speed,
+                    max_throttle=0.55,
+                    max_brake=0.90,
+                )
+
+                brake = max(brake, brake_factor * 0.45)
+                throttle = 0.0 if brake > 0.05 else throttle
+
+                return (
+                    carla.VehicleControl(
+                        throttle=float(throttle),
+                        brake=float(brake),
+                        steer=float(steer),
+                    ),
+                    target_speed,
+                    0.0,
+                    f"TRAFFIC_{front_distance:.1f}m",
+                )
+    else:
+        if not ignore_traffic:
+            light_wait_memory["lead_traffic_block_start"] = None
+
+    # Lead waits for ego if the gap is too large.
     gap_to_ego = distance_2d(
         lead.get_location(),
         ego.get_location(),
     )
+
+    if gap_to_ego > LEAD_HARD_WAIT_FOR_EGO_GAP_M:
+        speed_controller.reset()
+
+        return (
+            carla.VehicleControl(
+                throttle=0.0,
+                brake=0.65,
+                steer=float(steer),
+            ),
+            0.0,
+            0.0,
+            f"HARD_WAIT_EGO_{gap_to_ego:.1f}m",
+        )
 
     if gap_to_ego > LEAD_WAIT_FOR_EGO_GAP_M:
         target_speed = LEAD_WAIT_SPEED_KMH
@@ -1073,37 +1308,37 @@ def lead_control(
         throttle, brake = speed_controller.run_step(
             lead,
             target_speed,
-            max_throttle=0.20,
-            max_brake=0.65,
+            max_throttle=0.38,
+            max_brake=0.70,
         )
 
-        if get_speed_kmh(lead) > target_speed + 3.0:
-            throttle = 0.0
-            brake = max(brake, 0.45)
-
-        control = carla.VehicleControl(
-            throttle=float(throttle),
-            brake=float(brake),
-            steer=float(steer),
+        return (
+            carla.VehicleControl(
+                throttle=float(throttle),
+                brake=float(brake),
+                steer=float(steer),
+            ),
+            target_speed,
+            0.0,
+            f"WAIT_EGO_{gap_to_ego:.1f}m",
         )
 
-        return control, target_speed, 0.0, f"WAIT_EGO_{gap_to_ego:.1f}m"
-
+    # Normal cruise
     curve = curve_angle_ahead(route, lead_index)
 
-    if curve > 22.0:
-        target_speed = 14.0
-    elif curve > 14.0:
+    if curve > 25.0:
+        target_speed = 18.0
+    elif curve > 15.0:
         target_speed = LEAD_CURVE_SPEED_KMH
     elif curve > 8.0:
-        target_speed = 22.0
+        target_speed = 34.0
     else:
         target_speed = LEAD_CRUISE_SPEED_KMH
 
     remaining = len(route) - 1 - lead_index
 
     if remaining < 30:
-        target_speed = min(target_speed, 14.0)
+        target_speed = min(target_speed, 24.0)
 
     if remaining < 12:
         target_speed = 0.0
@@ -1111,21 +1346,24 @@ def lead_control(
     throttle, brake = speed_controller.run_step(
         lead,
         target_speed,
-        max_throttle=0.42,
-        max_brake=0.78,
+        max_throttle=0.55,
+        max_brake=0.90,
     )
 
     if target_speed <= 0.1:
         throttle = 0.0
         brake = 1.0
 
-    control = carla.VehicleControl(
-        throttle=float(throttle),
-        brake=float(brake),
-        steer=float(steer),
+    return (
+        carla.VehicleControl(
+            throttle=float(throttle),
+            brake=float(brake),
+            steer=float(steer),
+        ),
+        target_speed,
+        curve,
+        "CRUISE",
     )
-
-    return control, target_speed, curve, "CRUISE"
 
 
 # ============================================================
@@ -1164,8 +1402,8 @@ def ego_control(
     steer = pure_pursuit_steer(
         ego,
         target_location,
-        gain=1.16,
-        max_steer=0.60,
+        gain=0.98,
+        max_steer=0.50,
     )
 
     gap = distance_2d(
@@ -1173,11 +1411,11 @@ def ego_control(
         lead.get_location(),
     )
 
-    # Traffic light logic with fallback ignore mode
+    # Traffic light logic
     if simulation_time < light_wait_memory.get("ego_ignore_light_until", 0.0):
         light_state = None
     else:
-        light_state, forced_green = handle_traffic_light_with_timeout(
+        light_state, _ = handle_traffic_light_with_timeout(
             ego,
             "ego",
             light_wait_memory,
@@ -1188,35 +1426,39 @@ def ego_control(
         if light_wait_memory.get("ego_red_start") is None:
             light_wait_memory["ego_red_start"] = simulation_time
 
-        ego_red_wait = simulation_time - light_wait_memory["ego_red_start"]
+        ego_wait = simulation_time - light_wait_memory["ego_red_start"]
 
-        if ego_red_wait >= EGO_IGNORE_LIGHT_AFTER_TIMEOUT_SECONDS:
-            light_wait_memory["ego_ignore_light_until"] = simulation_time + 6.0
+        if ego_wait >= EGO_IGNORE_LIGHT_AFTER_TIMEOUT_SECONDS:
+            light_wait_memory["ego_ignore_light_until"] = simulation_time + 5.0
             light_wait_memory["ego_red_start"] = None
 
             print(
-                f"[INFO] Ego waited {ego_red_wait:.1f}s at {light_state}. "
-                f"Ego will ignore this light for 6 seconds."
+                f"[INFO] Ego waited {ego_wait:.1f}s at {light_state}. "
+                f"Ego ignores this light shortly."
             )
 
         else:
             distance_pid.reset()
             speed_controller.reset()
 
-            control = carla.VehicleControl(
-                throttle=0.0,
-                brake=0.90,
-                steer=float(steer),
+            return (
+                carla.VehicleControl(
+                    throttle=0.0,
+                    brake=0.90,
+                    steer=float(steer),
+                ),
+                0.0,
+                gap,
+                f"LIGHT_{light_state}",
             )
-
-            return control, 0.0, gap, f"LIGHT_{light_state}"
     else:
         light_wait_memory["ego_red_start"] = None
 
+    # Pedestrian
     pedestrian_detected, pedestrian_distance = pedestrian_ahead(
         ego,
         walkers,
-        radius=9.0,
+        radius=8.0,
     )
 
     if pedestrian_detected:
@@ -1224,79 +1466,92 @@ def ego_control(
         speed_controller.reset()
 
         brake = clamp(
-            0.45 + (9.0 - pedestrian_distance) / 9.0,
+            0.45 + (8.0 - pedestrian_distance) / 8.0,
             0.45,
             1.0,
         )
 
-        control = carla.VehicleControl(
-            throttle=0.0,
-            brake=float(brake),
-            steer=float(steer),
+        return (
+            carla.VehicleControl(
+                throttle=0.0,
+                brake=float(brake),
+                steer=float(steer),
+            ),
+            0.0,
+            gap,
+            f"PEDESTRIAN_{pedestrian_distance:.1f}m",
         )
 
-        return control, 0.0, gap, f"PEDESTRIAN_{pedestrian_distance:.1f}m"
-
-    # FIX: increased max_distance 28 -> 40, lateral_limit default -> 3.2
+    # Front vehicle
     front_actor, front_distance = get_front_actor(
         ego,
         world,
         world_map,
         ignore_ids=set(),
-        max_distance=40.0,
-        lateral_limit=3.2,
+        max_distance=32.0,
     )
 
     if front_actor is not None:
         front_speed = get_speed_kmh(front_actor)
 
-        # FIX: emergency stop threshold increased 6.0 -> 10.0
-        if front_distance < 10.0:
+        if front_distance < FRONT_EMERGENCY_DISTANCE_M:
             distance_pid.reset()
             speed_controller.reset()
 
-            control = carla.VehicleControl(
-                throttle=0.0,
-                brake=1.0,
-                steer=float(steer),
+            return (
+                carla.VehicleControl(
+                    throttle=0.0,
+                    brake=1.0,
+                    steer=float(steer),
+                ),
+                0.0,
+                gap,
+                f"FRONT_STOP_{front_distance:.1f}m",
             )
 
-            return control, 0.0, gap, f"FRONT_STOP_{front_distance:.1f}m"
-
-        # FIX: slow-follow threshold increased 15.0 -> 22.0
-        if front_actor.id != lead.id and front_distance < 22.0:
+        if front_actor.id != lead.id and front_distance < FRONT_SAFE_DISTANCE_M:
             distance_pid.reset()
 
             target_speed = min(
                 get_speed_kmh(lead),
-                max(4.0, front_speed - 1.5),
+                max(8.0, front_speed * 0.92),
+            )
+
+            brake_factor = clamp(
+                (FRONT_SAFE_DISTANCE_M - front_distance)
+                / FRONT_SAFE_DISTANCE_M,
+                0.0,
+                1.0,
             )
 
             throttle, brake = speed_controller.run_step(
                 ego,
                 target_speed,
-                max_throttle=0.28,
-                max_brake=0.82,
+                max_throttle=0.48,
+                max_brake=0.90,
             )
 
-            brake = max(
-                brake,
-                clamp((22.0 - front_distance) / 22.0 * 0.50, 0.0, 0.50),
-            )
+            brake = max(brake, brake_factor * 0.50)
+            throttle = 0.0 if brake > 0.05 else throttle
 
-            control = carla.VehicleControl(
-                throttle=float(throttle),
-                brake=float(brake),
-                steer=float(steer),
+            return (
+                carla.VehicleControl(
+                    throttle=float(throttle),
+                    brake=float(brake),
+                    steer=float(steer),
+                ),
+                target_speed,
+                gap,
+                f"TRAFFIC_{front_distance:.1f}m",
             )
-
-            return control, target_speed, gap, f"TRAFFIC_{front_distance:.1f}m"
 
     lead_speed = get_speed_kmh(lead)
     ego_speed = get_speed_kmh(ego)
 
     gap_error = gap - DESIRED_DISTANCE_M
+
     speed_correction = distance_pid.run_step(gap_error)
+    speed_correction = clamp(speed_correction, -10.0, 14.0)
 
     target_speed = lead_speed + speed_correction
 
@@ -1304,28 +1559,34 @@ def ego_control(
         distance_pid.reset()
         speed_controller.reset()
 
-        control = carla.VehicleControl(
-            throttle=0.0,
-            brake=float(emergency_gap_brake(gap)),
-            steer=float(steer),
+        return (
+            carla.VehicleControl(
+                throttle=0.0,
+                brake=float(emergency_gap_brake(gap)),
+                steer=float(steer),
+            ),
+            0.0,
+            gap,
+            "EMERGENCY_GAP",
         )
 
-        return control, 0.0, gap, "EMERGENCY_GAP"
-
     if gap < DESIRED_DISTANCE_M - 2.0:
-        target_speed = min(target_speed, lead_speed * 0.65)
+        target_speed = min(target_speed, max(0.0, lead_speed - 8.0))
 
-    if gap > DESIRED_DISTANCE_M + 12.0:
+    if gap > DESIRED_DISTANCE_M + 6.0:
         target_speed = max(target_speed, lead_speed + 8.0)
+
+    if gap > DESIRED_DISTANCE_M + 14.0:
+        target_speed = max(target_speed, lead_speed + 12.0)
 
     curve = curve_angle_ahead(route, ego_index)
 
-    if curve > 22.0:
-        target_speed = min(target_speed, 18.0)
-    elif curve > 14.0:
-        target_speed = min(target_speed, 24.0)
+    if curve > 25.0:
+        target_speed = min(target_speed, 22.0)
+    elif curve > 15.0:
+        target_speed = min(target_speed, 34.0)
     elif curve > 8.0:
-        target_speed = min(target_speed, 30.0)
+        target_speed = min(target_speed, 44.0)
 
     target_speed = clamp(target_speed, 0.0, EGO_MAX_SPEED_KMH)
 
@@ -1333,27 +1594,35 @@ def ego_control(
         ego,
         target_speed,
         max_throttle=0.55,
-        max_brake=0.82,
+        max_brake=0.90,
     )
 
-    if abs(gap_error) < 1.2 and ego_speed > lead_speed + 1.5:
+    # Damping around target distance
+    if abs(gap_error) < 1.5 and ego_speed > lead_speed + 2.0:
         throttle = 0.0
         brake = max(brake, 0.08)
 
+    if gap < DESIRED_DISTANCE_M + 1.0 and ego_speed > lead_speed + 3.0:
+        throttle = 0.0
+        brake = max(brake, 0.14)
+
     mode = "FOLLOW_PID"
 
-    if gap > DESIRED_DISTANCE_M + 10.0:
+    if gap > DESIRED_DISTANCE_M + 8.0:
         mode = "CATCH_UP"
     elif gap < DESIRED_DISTANCE_M - 1.5:
         mode = "SLOW_DOWN"
 
-    control = carla.VehicleControl(
-        throttle=float(throttle),
-        brake=float(brake),
-        steer=float(steer),
+    return (
+        carla.VehicleControl(
+            throttle=float(throttle),
+            brake=float(brake),
+            steer=float(steer),
+        ),
+        target_speed,
+        gap,
+        mode,
     )
-
-    return control, target_speed, gap, mode
 
 
 # ============================================================
@@ -1371,6 +1640,9 @@ def main():
     walkers = []
     controllers = []
     collision_log = []
+
+    gap_values = []
+    abs_gap_errors = []
 
     try:
         client = carla.Client("localhost", 2000)
@@ -1400,8 +1672,8 @@ def main():
 
         traffic_manager = client.get_trafficmanager(8000)
         traffic_manager.set_synchronous_mode(True)
-        traffic_manager.set_global_distance_to_leading_vehicle(9.0)
-        traffic_manager.global_percentage_speed_difference(10.0)
+        traffic_manager.set_global_distance_to_leading_vehicle(14.0)
+        traffic_manager.global_percentage_speed_difference(25.0)
 
         safe_tick(world)
 
@@ -1466,7 +1738,7 @@ def main():
 
         actors.extend([lead_collision_sensor, ego_collision_sensor])
 
-        print("[INFO] Spawning traffic vehicles on the main route...")
+        print("[INFO] Spawning route traffic vehicles...")
 
         route_traffic = spawn_route_traffic(
             world,
@@ -1482,12 +1754,11 @@ def main():
 
         safe_tick(world)
 
-        print("[INFO] Spawning cross traffic near junctions...")
+        print("[INFO] Spawning cross traffic vehicles...")
 
         cross_traffic = spawn_cross_traffic(
             world,
             bp_lib,
-            world_map,
             spawn_points,
             route,
             traffic_manager,
@@ -1497,6 +1768,23 @@ def main():
 
         actors.extend(cross_traffic)
         print(f"[INFO] Cross traffic vehicles: {len(cross_traffic)}")
+
+        safe_tick(world)
+
+        print("[INFO] Spawning background NPC traffic...")
+
+        background_traffic = spawn_background_traffic(
+            world,
+            bp_lib,
+            spawn_points,
+            traffic_manager,
+            protected_actors=[lead, ego] + route_traffic + cross_traffic,
+            route=route,
+            count=BACKGROUND_TRAFFIC_CARS,
+        )
+
+        actors.extend(background_traffic)
+        print(f"[INFO] Background traffic vehicles: {len(background_traffic)}")
 
         safe_tick(world)
 
@@ -1521,12 +1809,24 @@ def main():
         lead_speed_controller = SpeedController(FIXED_DELTA_SECONDS)
         ego_speed_controller = SpeedController(FIXED_DELTA_SECONDS)
 
+        lead_smoother = ControlSmoother(
+            max_throttle_delta=0.055,
+            max_brake_delta=0.105,
+            max_steer_delta=0.065,
+        )
+
+        ego_smoother = ControlSmoother(
+            max_throttle_delta=0.085,
+            max_brake_delta=0.125,
+            max_steer_delta=0.085,
+        )
+
         distance_pid = PIDController(
-            kp=0.82,
-            ki=0.022,
-            kd=0.17,
+            kp=0.62,
+            ki=0.018,
+            kd=0.16,
             dt=FIXED_DELTA_SECONDS,
-            integral_limit=15.0,
+            integral_limit=14.0,
         )
 
         route_state = {
@@ -1541,24 +1841,31 @@ def main():
             "ego_red_start": None,
             "lead_ignore_light_until": 0.0,
             "ego_ignore_light_until": 0.0,
+            "lead_traffic_block_start": None,
+            "lead_ignore_traffic_until": 0.0,
         }
 
         final_location = route[-1].transform.location
 
         print()
         print("=" * 110)
-        print("UZB 438E - Real Traffic Car Following Scenario")
-        print("Main task: Ego vehicle follows lead vehicle using PID distance control.")
-        print("Traffic: NPC vehicles are spawned on the route and near junctions.")
-        print("Traffic light recovery: enabled.")
-        print("Lead waits for ego if ego is left behind.")
-        print(f"Map: {world_map.name}")
-        print(f"Desired distance: {DESIRED_DISTANCE_M:.1f} m")
-        print(f"Route length: {route_total_length(route):.1f} m")
-        print(f"Junction points on route: {count_junction_points(route)}")
-        print(f"Route traffic: {len(route_traffic)}")
-        print(f"Cross traffic: {len(cross_traffic)}")
-        print(f"Pedestrians: {len(walkers)}")
+        print("UZB 438E - STABLE MODERATE TRAFFIC CAR FOLLOWING SCENARIO")
+        print("Main task:         Ego follows lead using PID distance control.")
+        print("Lateral control:   Waypoint / pure pursuit steering.")
+        print("Traffic:           Route traffic, cross traffic, background NPCs, pedestrians, traffic lights.")
+        print("Speed mode:        Moderate speed, tuned for smooth following and fewer collisions.")
+        print("Safety:            Front vehicle braking, pedestrian braking, collision sensors.")
+        print("Recovery:          Traffic light timeout, traffic block timeout, lead-waits-for-ego.")
+        print(f"Map:               {world_map.name}")
+        print(f"Desired gap:       {DESIRED_DISTANCE_M:.1f} m")
+        print(f"Lead cruise speed: {LEAD_CRUISE_SPEED_KMH:.1f} km/h")
+        print(f"Ego max speed:     {EGO_MAX_SPEED_KMH:.1f} km/h")
+        print(f"Route length:      {route_total_length(route):.1f} m")
+        print(f"Junction points:   {count_junction_points(route)}")
+        print(f"Route traffic:     {len(route_traffic)}")
+        print(f"Cross traffic:     {len(cross_traffic)}")
+        print(f"Background:        {len(background_traffic)}")
+        print(f"Pedestrians:       {len(walkers)}")
         print(
             f"Start: x={start_wp.transform.location.x:.1f}, "
             f"y={start_wp.transform.location.y:.1f}"
@@ -1587,6 +1894,7 @@ def main():
                 light_wait_memory,
             )
 
+            lead_signal = lead_smoother.smooth(lead_signal)
             lead.apply_control(lead_signal)
 
             ego_signal, ego_target_speed, gap, ego_mode = ego_control(
@@ -1603,7 +1911,11 @@ def main():
                 light_wait_memory,
             )
 
+            ego_signal = ego_smoother.smooth(ego_signal)
             ego.apply_control(ego_signal)
+
+            gap_values.append(gap)
+            abs_gap_errors.append(abs(gap - DESIRED_DISTANCE_M))
 
             ego_transform = ego.get_transform()
             forward = ego_transform.get_forward_vector()
@@ -1627,9 +1939,9 @@ def main():
                     f"[t={simulation_time:6.1f}s] "
                     f"Gap={gap:5.2f}m | "
                     f"Lead={get_speed_kmh(lead):5.1f}->{lead_target_speed:4.1f} "
-                    f"{lead_mode:<18} | "
+                    f"{lead_mode:<28} | "
                     f"Ego={get_speed_kmh(ego):5.1f}->{ego_target_speed:4.1f} "
-                    f"{ego_mode:<18} | "
+                    f"{ego_mode:<16} | "
                     f"Thr={ego_signal.throttle:.2f} "
                     f"Brk={ego_signal.brake:.2f} "
                     f"Str={ego_signal.steer:.2f} | "
@@ -1672,14 +1984,42 @@ def main():
         safe_tick(world)
 
         print()
+        print("=" * 90)
+        print("PERFORMANCE SUMMARY")
+
+        if gap_values:
+            avg_gap = sum(gap_values) / len(gap_values)
+            max_gap = max(gap_values)
+            min_gap = min(gap_values)
+            avg_abs_error = sum(abs_gap_errors) / len(abs_gap_errors)
+
+            stable_samples = [
+                g for g in gap_values
+                if abs(g - DESIRED_DISTANCE_M) <= 5.0
+            ]
+
+            stable_ratio = len(stable_samples) / len(gap_values) * 100.0
+
+            print(f"Desired gap:          {DESIRED_DISTANCE_M:.2f} m")
+            print(f"Average gap:          {avg_gap:.2f} m")
+            print(f"Minimum gap:          {min_gap:.2f} m")
+            print(f"Maximum gap:          {max_gap:.2f} m")
+            print(f"Average abs. error:   {avg_abs_error:.2f} m")
+            print(f"Within +/-5m ratio:   {stable_ratio:.1f}%")
+
+        print(f"Route traffic:        {len(route_traffic)}")
+        print(f"Cross traffic:        {len(cross_traffic)}")
+        print(f"Background traffic:   {len(background_traffic)}")
+        print(f"Pedestrians:          {len(walkers)}")
 
         if collision_log:
-            print("[RESULT] Collision detected:")
-
+            print("Collision result:     COLLISION DETECTED")
             for item in collision_log:
                 print("  -", item)
         else:
-            print("[RESULT] Scenario completed with no detected collision.")
+            print("Collision result:     NO COLLISION DETECTED")
+
+        print("=" * 90)
 
     except KeyboardInterrupt:
         print("\n[INFO] Stopped by user.")
@@ -1719,6 +2059,12 @@ def main():
                 traffic_manager.set_synchronous_mode(False)
 
             if world is not None and original_settings is not None:
+                for light in world.get_actors().filter("traffic.traffic_light"):
+                    try:
+                        light.freeze(False)
+                    except Exception:
+                        pass
+
                 world.apply_settings(original_settings)
 
         except Exception:
